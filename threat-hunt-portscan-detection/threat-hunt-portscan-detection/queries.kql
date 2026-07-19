@@ -1,0 +1,79 @@
+// =============================================================================
+// Threat Hunt: Internal Port Scanning Activity via PowerShell
+// Case ID: TH-2026-0627-014
+// Data Source: Microsoft Defender for Endpoint (Advanced Hunting / KQL)
+// =============================================================================
+
+
+// -----------------------------------------------------------------------------
+// Query 1 - Identify hosts with abnormal internal-to-internal failed connection
+// volume. High failed-connection counts against many distinct RemoteIP/RemotePort
+// pairs from a single LocalIP is a strong indicator of port scanning.
+// -----------------------------------------------------------------------------
+DeviceNetworkEvents
+| where ActionType == "ConnectionFailed"
+| where isnotempty(LocalIP)
+| where LocalIP startswith "10."
+| where RemoteIP startswith "10."
+| summarize ConnectionCount = count() by DeviceName, ActionType, LocalIP, RemoteIP, RemotePort
+| order by ConnectionCount desc
+
+// Result: 10.3.0.44 (angeltestvm) showed a disproportionately high number of
+// failed connections against many distinct internal IPs/ports.
+
+
+// -----------------------------------------------------------------------------
+// Query 2 - Isolate all failed connection attempts originating from the
+// suspicious IP to confirm the scan pattern (sequential ports/hosts).
+// -----------------------------------------------------------------------------
+let SuspiciousIp = "10.3.0.44";
+DeviceNetworkEvents
+| where LocalIP == SuspiciousIp
+| where ActionType == "ConnectionFailed"
+| where RemoteIP startswith "10."
+
+
+// -----------------------------------------------------------------------------
+// Query 3 - Order the confirmed scan traffic by timestamp to establish the
+// scan's start time, used as the pivot point for process/file correlation.
+// -----------------------------------------------------------------------------
+let SuspiciousIP = "10.3.0.44";
+DeviceNetworkEvents
+| where LocalIP == SuspiciousIP
+| where RemoteIP startswith "10."
+| order by Timestamp desc
+
+// Result: Scanning activity began approximately 09:15 AM on Jun 27, 2026.
+
+
+// -----------------------------------------------------------------------------
+// Query 4 - Pivot to DeviceProcessEvents around the scan start time to
+// identify the process responsible for generating the scan traffic.
+// -----------------------------------------------------------------------------
+let VMName = "angeltestvm";
+let specificTime = datetime(2026-06-27T13:15:19.0427420Z);
+DeviceProcessEvents
+| where TimeGenerated between ((specificTime - 10m) .. (specificTime + 10m))
+| order by Timestamp desc
+| where DeviceName == VMName
+| project Timestamp, FileName, InitiatingProcessCommandLine, InitiatingProcessParentCreationTime, AccountName
+
+// Result: powershell.exe executed C:\ProgramData\portscan.ps1 via
+// cmd.exe /c powershell.exe -ExecutionPolicy Bypass, under account angcra05.
+
+
+// -----------------------------------------------------------------------------
+// Query 5 - Confirm the script's origin on disk by correlating with
+// DeviceFileEvents for the same host/time window.
+// -----------------------------------------------------------------------------
+let VMName = "angeltestvm";
+let specificTime = datetime(2026-06-27T13:15:19.0427420Z);
+DeviceFileEvents
+| where TimeGenerated between ((specificTime - 10m) .. (specificTime + 10m))
+| order by Timestamp desc
+| where DeviceName == VMName
+| project ActionType, DeviceName, FileName, FolderPath
+| where FolderPath contains "portscan"
+
+// Result: portscan.ps1 was created at C:\ProgramData\portscan.ps1 shortly
+// before the scan traffic began - corroborating the process telemetry above.
